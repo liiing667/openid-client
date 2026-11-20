@@ -1183,6 +1183,107 @@ export interface DynamicClientRegistrationRequestOptions
 }
 
 /**
+ * Validates a Dynamic Client Registration response against the Authorization
+ * Server that was discovered and the Client Metadata that was sent in the
+ * registration request, then merges the two into the Client Metadata the local
+ * {@link Configuration} is created from.
+ *
+ * The registration response is only allowed to describe a client at the
+ * Authorization Server the request was sent to. Client-side metadata that the
+ * Authorization Server cannot (or chose not to) echo back - such as PKCE
+ * inputs, algorithm preferences or other legacy metadata fields - is preserved
+ * instead of being silently dropped.
+ */
+function processRegistration(
+  as: oauth.AuthorizationServer,
+  requested: Partial<ClientMetadata>,
+  registered: ClientMetadata,
+): ClientMetadata {
+  let issuerMismatch = false
+  if (registered.issuer !== undefined) {
+    let registeredIssuer: URL
+    try {
+      registeredIssuer = new URL(String(registered.issuer))
+    } catch (cause) {
+      throw new ClientError(
+        'registration response "issuer" is not a valid issuer identifier',
+        {
+          code: oauth.INVALID_RESPONSE,
+          cause: {
+            body: registered,
+            attribute: 'issuer',
+            cause,
+          },
+        },
+      )
+    }
+
+    issuerMismatch = registeredIssuer.href !== new URL(as.issuer).href
+  }
+
+  if (issuerMismatch) {
+    throw new ClientError(
+      'registration response "issuer" does not match the authorization server issuer',
+      {
+        code: oauth.JSON_ATTRIBUTE_COMPARISON,
+        cause: {
+          expected: new URL(as.issuer).href,
+          body: registered,
+          attribute: 'issuer',
+        },
+      },
+    )
+  }
+
+  if (
+    requested.client_id !== undefined &&
+    requested.client_id !== registered.client_id
+  ) {
+    throw new ClientError(
+      'registration response "client_id" does not match the requested "client_id"',
+      {
+        code: oauth.JSON_ATTRIBUTE_COMPARISON,
+        cause: {
+          expected: requested.client_id,
+          body: registered,
+          attribute: 'client_id',
+        },
+      },
+    )
+  }
+
+  if (
+    typeof requested.client_secret === 'string' &&
+    requested.client_secret.length &&
+    typeof registered.client_secret === 'string' &&
+    registered.client_secret.length &&
+    requested.client_secret !== registered.client_secret
+  ) {
+    throw new ClientError(
+      'registration response "client_secret" does not match the requested "client_secret"',
+      {
+        code: oauth.JSON_ATTRIBUTE_COMPARISON,
+        cause: {
+          body: registered,
+          attribute: 'client_secret',
+        },
+      },
+    )
+  }
+
+  const merged = structuredClone(requested) as ClientMetadata
+  for (const key of Object.keys(registered)) {
+    ;(merged as Record<string, unknown>)[key] = (
+      registered as Record<string, unknown>
+    )[key]
+  }
+
+  delete (merged as Partial<ClientMetadata>).issuer
+
+  return merged
+}
+
+/**
  * Discovers an authorization server and dynamically registers a client.
  *
  * Performs Authorization Server Metadata discovery and subsequently a Dynamic
@@ -1201,6 +1302,19 @@ export interface DynamicClientRegistrationRequestOptions
  * > {@link ServerMetadata.token_endpoint_auth_methods_supported}, nor does it
  * > default the "clientAuthentication" argument value beyond what its description
  * > says.
+ *
+ * > [!NOTE]\
+ * > The returned {@link Configuration} is always bound to the discovered
+ * > Authorization Server. A registration response that identifies a different
+ * > "issuer", changes the requested "client_id", or silently replaces a provided
+ * > "client_secret" is rejected with a {@link ClientError} rather than redirecting
+ * > the local client elsewhere.
+ *
+ * > [!NOTE]\
+ * > Client Metadata sent in the registration request that the Authorization
+ * > Server does not echo back (e.g. PKCE parameters, algorithm preferences or
+ * > other legacy metadata fields) is retained and merged with the registration
+ * > response, response values taking precedence.
  *
  * @param server URL representation of the Authorization Server's Issuer
  *   Identifier
@@ -1265,6 +1379,8 @@ export async function dynamicClientRegistration(
 
     errorHandler(err)
   }
+
+  registered = processRegistration(as, metadata, registered)
 
   registered[oauth.clockSkew] = clockSkew
   registered[oauth.clockTolerance] = clockTolerance
