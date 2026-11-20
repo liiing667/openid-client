@@ -42,6 +42,7 @@ for (const poll of [
     const resource = 'https://resource.example.com'
     config[client.customFetch] = async (_url, options) => {
       requestTimes.push(elapsed)
+      assert.strictEqual(options.headers.dpop, undefined)
       const parameters = new URLSearchParams(options.body as string)
       assert.strictEqual(parameters.get('resource'), resource)
       const device = poll === client.pollDeviceAuthorizationGrant
@@ -136,6 +137,82 @@ for (const poll of [
       assert.strictEqual(result.token_type, 'dpop')
     })
   }
+
+  test(`${poll.name} rebinds a fresh DPoP proof to the same request on nonce retry`, async () => {
+    const tokenEndpoint = `${issuer.origin}/token`
+    const config = new client.Configuration(
+      {
+        issuer: issuer.href,
+        token_endpoint: tokenEndpoint,
+        device_authorization_endpoint: `${issuer.origin}/device`,
+        backchannel_authentication_endpoint: `${issuer.origin}/ciba`,
+        userinfo_endpoint: `${issuer.origin}/userinfo`,
+      },
+      'client',
+    )
+    const DPoP = client.getDPoPHandle(
+      config,
+      await client.randomDPoPKeyPair('ES256'),
+    )
+    const device = poll === client.pollDeviceAuthorizationGrant
+    const grantType = device
+      ? 'urn:ietf:params:oauth:grant-type:device_code'
+      : 'urn:openid:params:grant-type:ciba'
+    const codeParameter = device ? 'device_code' : 'auth_req_id'
+    const grantCode = device
+      ? authorizationResponse.device_code
+      : authorizationResponse.auth_req_id
+    const requests: Array<{
+      url: string
+      parameters: URLSearchParams
+      proof: jose.JWTPayload
+      header: string
+    }> = []
+    config[client.customFetch] = async (url, options) => {
+      const header = options.headers.dpop
+      requests.push({
+        url,
+        parameters: new URLSearchParams(options.body as string),
+        proof: jose.decodeJwt(header),
+        header,
+      })
+      return requests.length === 1
+        ? Response.json(
+            { error: 'use_dpop_nonce' },
+            { status: 400, headers: { 'dpop-nonce': 'server-nonce' } },
+          )
+        : Response.json({
+            access_token: 'access_token',
+            token_type: 'dpop',
+          })
+    }
+
+    const result = await poll(config, authorizationResponse, undefined, {
+      DPoP,
+    })
+    assert.strictEqual(result.token_type, 'dpop')
+    assert.strictEqual(requests.length, 2)
+
+    // The retry is still the same request: same endpoint, same grant, and
+    // every proof is bound to that request's target rather than to any of
+    // the server's other endpoints.
+    for (const request of requests) {
+      assert.strictEqual(request.url, tokenEndpoint)
+      assert.strictEqual(request.parameters.get('grant_type'), grantType)
+      assert.strictEqual(request.parameters.get(codeParameter), grantCode)
+      assert.strictEqual(request.proof.htm, 'POST')
+      assert.strictEqual(request.proof.htu, tokenEndpoint)
+      assert.strictEqual(request.proof.ath, undefined)
+    }
+
+    // The final request carries exactly the server-issued nonce, no drift.
+    assert.strictEqual(requests[0].proof.nonce, undefined)
+    assert.strictEqual(requests[1].proof.nonce, 'server-nonce')
+
+    // No proof is ever replayed: each attempt signs a fresh proof.
+    assert.notStrictEqual(requests[0].proof.jti, requests[1].proof.jti)
+    assert.notStrictEqual(requests[0].header, requests[1].header)
+  })
 
   test(`${poll.name} stops after repeated DPoP nonce challenges`, async () => {
     const config = new client.Configuration(
