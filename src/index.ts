@@ -1419,6 +1419,7 @@ async function performDiscovery(
 
   const timeout = options?.timeout ?? 30
   const signal = AbortSignal.timeout(timeout * 1000)
+  let source!: string
   const as = await (
     resolve
       ? oauth.discoveryRequest(server, {
@@ -1450,28 +1451,63 @@ async function performDiscovery(
           },
         )
   )
-    .then((response) =>
+    .then((response) => {
+      source = response.url
       // @ts-expect-error
-      oauth.processDiscoveryResponse(oauth._nodiscoverycheck, response),
-    )
+      return oauth.processDiscoveryResponse(oauth._nodiscoverycheck, response)
+    })
     .catch(errorHandler)
 
-  if (resolve && new URL(as.issuer).href !== server.href) {
-    handleEntraId(server, as, options) ||
-      handleB2Clogin(server, options) ||
-      (() => {
-        throw new ClientError(
-          'discovered metadata issuer does not match the expected issuer',
-          {
-            code: oauth.JSON_ATTRIBUTE_COMPARISON,
-            cause: {
-              expected: server.href,
-              body: as,
-              attribute: 'issuer',
+  // The discovery document must be received from the same origin as the
+  // expected issuer, this ensures a redirected or otherwise substituted
+  // response (e.g. from a similar looking host) cannot stand in for the
+  // expected issuer's metadata. Responses without a URL (e.g. ones
+  // constructed by a custom fetch implementation) cannot be checked and are
+  // skipped.
+  if (source && new URL(source).origin !== server.origin) {
+    throw new ClientError(
+      'discovered metadata was received from an unexpected source',
+      {
+        code: oauth.INVALID_RESPONSE,
+        cause: {
+          expected: server.origin,
+          received: new URL(source).origin,
+        },
+      },
+    )
+  }
+
+  if (resolve) {
+    let issuer: URL
+    try {
+      issuer = new URL(as.issuer)
+    } catch {
+      throw new ClientError('discovered metadata issuer is not a valid URL', {
+        code: oauth.INVALID_RESPONSE,
+        cause: {
+          body: as,
+          attribute: 'issuer',
+        },
+      })
+    }
+
+    if (issuer.href !== server.href) {
+      handleEntraId(server, as, options) ||
+        handleB2Clogin(server, options) ||
+        (() => {
+          throw new ClientError(
+            'discovered metadata issuer does not match the expected issuer',
+            {
+              code: oauth.JSON_ATTRIBUTE_COMPARISON,
+              cause: {
+                expected: server.href,
+                body: as,
+                attribute: 'issuer',
+              },
             },
-          },
-        )
-      })()
+          )
+        })()
+    }
   }
 
   return as
@@ -2810,6 +2846,10 @@ export function allowInsecureRequests(config: Configuration) {
  * memory cache between their code's invocations. Use in runtimes where an in
  * memory cache between requests is available is not desirable.
  *
+ * Caches exported through {@link getJwksCache} are bound to the issuer they were
+ * exported from and are rejected when imported into a {@link Configuration} for
+ * a different issuer.
+ *
  * @param jwksCache JWKS Cache previously obtained from {@link getJwksCache}
  *
  * @group Advanced Configuration
@@ -2818,6 +2858,24 @@ export function setJwksCache(
   config: Configuration,
   jwksCache: oauth.ExportedJWKSCache,
 ) {
+  const { issuer } = int(config).as
+  if (
+    'iss' in jwksCache &&
+    typeof jwksCache.iss === 'string' &&
+    jwksCache.iss !== issuer
+  ) {
+    throw new ClientError(
+      'JWKS cache does not belong to the configured issuer',
+      {
+        code: oauth.JSON_ATTRIBUTE_COMPARISON,
+        cause: {
+          expected: issuer,
+          received: jwksCache.iss,
+          attribute: 'iss',
+        },
+      },
+    )
+  }
   int(config).jwksCache = structuredClone(jwksCache)
 }
 
@@ -2845,7 +2903,9 @@ export function getJwksCache(
 ): oauth.ExportedJWKSCache | undefined {
   const cache = int(config).jwksCache
   if (cache.uat) {
-    return cache as oauth.ExportedJWKSCache
+    const exported = { ...cache } as oauth.ExportedJWKSCache & { iss: string }
+    exported.iss = int(config).as.issuer
+    return exported
   }
   return undefined
 }
