@@ -28,6 +28,7 @@ interface Internal {
   decrypt?: oauth.JweDecryptFunction
   jwksCache: oauth.JWKSCacheInput
   implicit?: boolean
+  revocation: RevocationRegistry
 }
 
 const int = (config: Configuration) => {
@@ -960,6 +961,220 @@ const decoder = new TextDecoder()
 
 function e(msg: string, cause: unknown, code?: string): ClientError {
   return new ClientError(msg, { cause, code })
+}
+
+/**
+ * A single recorded {@link tokenRevocation} attempt.
+ *
+ * Every invocation of {@link tokenRevocation} appends one entry per credential,
+ * including repeated revocations of the same token and attempts that failed
+ * because the revocation endpoint could not be reached or rejected the
+ * request.
+ *
+ * @group Token Management
+ */
+export interface TokenRevocationRecord {
+  /**
+   * Credential the record belongs to. Either `'access_token'` or
+   * `'refresh_token'` when a `token_type_hint` was provided, otherwise
+   * `'token'`.
+   */
+  readonly credential: 'access_token' | 'refresh_token' | 'token'
+  /**
+   * The revoked credential value.
+   */
+  readonly token: string
+  /**
+   * Revocation endpoint URL the request was sent to, or `undefined` when the
+   * endpoint was missing from the
+   * {@link ServerMetadata.revocation_endpoint server metadata} or invalid.
+   */
+  readonly endpoint?: string
+  /**
+   * Whether the authorization server confirmed the revocation (an HTTP 200
+   * response). Records with `ok: false` describe failed attempts that must not
+   * be treated as a confirmed revocation.
+   */
+  readonly ok: boolean
+  /**
+   * Number of recorded attempts for this credential, `1` for the first attempt,
+   * `2` for the first repeated revocation, and so on.
+   */
+  readonly attempt: number
+  /**
+   * Whether this record represents a repeated revocation of a credential that
+   * was already successfully revoked.
+   */
+  readonly duplicate: boolean
+  /**
+   * Failure details, present only when {@link TokenRevocationRecord.ok} is
+   * `false`.
+   */
+  readonly error?: {
+    /**
+     * Error name of the underlying failure.
+     */
+    readonly name: string
+    /**
+     * Error code of the underlying failure, when available.
+     */
+    readonly code?: string
+    /**
+     * Error message of the underlying failure.
+     */
+    readonly message: string
+  }
+}
+
+interface RevocationRegistry {
+  records: TokenRevocationRecord[]
+  revoked: Map<string, true>
+}
+
+function createRevocationRegistry(): RevocationRegistry {
+  return {
+    records: [],
+    revoked: new Map(),
+  }
+}
+
+/**
+ * An error raised when a {@link tokenRevocation} request fails, either because
+ * the revocation endpoint is missing or invalid, the request could not be
+ * completed, or the authorization server rejected the revocation.
+ *
+ * The failed attempt is still recorded and can be inspected with
+ * {@link getTokenRevocationRecords}.
+ *
+ * @group Errors
+ * @group Token Management
+ */
+export class TokenRevocationError extends ClientError {
+  /**
+   * Credential the failed revocation was attempted for. Either `'access_token'`
+   * or `'refresh_token'` when a `token_type_hint` was provided, otherwise
+   * `'token'`.
+   */
+  readonly credential: TokenRevocationRecord['credential']
+  /**
+   * The credential value the failed revocation was attempted for.
+   */
+  readonly token: string
+
+  /**
+   * @internal
+   */
+  constructor(
+    message: string,
+    options: { cause?: unknown; code?: string },
+    credential: TokenRevocationRecord['credential'],
+    token: string,
+  ) {
+    super(message, options)
+    this.credential = credential
+    this.token = token
+  }
+}
+
+/**
+ * An error raised by {@link fetchProtectedResource} when the access token was
+ * already confirmed as revoked through {@link tokenRevocation} on the same
+ * {@link Configuration}.
+ *
+ * This keeps the client-side logout/revocation state aligned with protected
+ * resource access instead of sending a credential the client knows to be
+ * invalid.
+ *
+ * @group Errors
+ * @group Protected Resource Requests
+ */
+export class RevokedTokenError extends ClientError {
+  /**
+   * The revoked access token value.
+   */
+  readonly token: string
+
+  /**
+   * @internal
+   */
+  constructor(message: string, token: string) {
+    super(message, { code: ERR_TOKEN_REVOKED })
+    this.token = token
+  }
+}
+
+const ERR_TOKEN_REVOCATION_FAILED = 'ERR_TOKEN_REVOCATION_FAILED'
+const ERR_TOKEN_REVOKED = 'ERR_TOKEN_REVOKED'
+
+function describeError(err: unknown): {
+  name: string
+  code?: string
+  message: string
+} {
+  const description: { name: string; code?: string; message: string } = {
+    name: err instanceof Error ? err.name : 'Error',
+    message: err instanceof Error ? err.message : String(err),
+  }
+  const code = (err as { code?: unknown } | null)?.code
+  if (typeof code === 'string') {
+    description.code = code
+  }
+  return description
+}
+
+function resolveRevocationEndpoint(
+  as: Readonly<ServerMetadata>,
+  c: Readonly<oauth.Client>,
+  tlsOnly: boolean,
+): URL {
+  const useMtlsAlias = c.use_mtls_endpoint_aliases === true
+  const value =
+    useMtlsAlias &&
+    as.mtls_endpoint_aliases &&
+    'revocation_endpoint' in as.mtls_endpoint_aliases
+      ? as.mtls_endpoint_aliases.revocation_endpoint
+      : as.revocation_endpoint
+
+  let url: URL
+  try {
+    url = new URL(value as string)
+  } catch {
+    throw new oauth.OperationProcessingError(
+      `authorization server metadata does not contain a valid ${
+        useMtlsAlias
+          ? '"as.mtls_endpoint_aliases.revocation_endpoint"'
+          : '"as.revocation_endpoint"'
+      }`,
+      {
+        code: oauth.MISSING_SERVER_METADATA,
+      },
+    )
+  }
+
+  if (tlsOnly && url.protocol !== 'https:') {
+    throw new oauth.OperationProcessingError(
+      'only requests to HTTPS are allowed',
+      { code: oauth.HTTP_REQUEST_FORBIDDEN },
+    )
+  }
+  if (url.protocol !== 'https:' && url.protocol !== 'http:') {
+    throw new oauth.OperationProcessingError(
+      'only requests to HTTP or HTTPS are allowed',
+      { code: oauth.REQUEST_PROTOCOL_FORBIDDEN },
+    )
+  }
+
+  return url
+}
+
+function recordRevocationAttempt(
+  registry: RevocationRegistry,
+  record: TokenRevocationRecord,
+): void {
+  if (record.error) {
+    Object.freeze(record.error)
+  }
+  registry.records.push(Object.freeze(record))
 }
 
 function errorHandler(err: unknown): never {
@@ -2122,6 +2337,7 @@ export class Configuration
       tlsOnly: true,
       timeout: 30,
       jwksCache: {},
+      revocation: createRevocationRegistry(),
     })
   }
 
@@ -4616,6 +4832,14 @@ export async function genericGrantRequest(
  * the token gets revoked, and the effect of that revocation is at the
  * discretion of the authorization server.
  *
+ * Every attempt is recorded on the {@link Configuration}, including repeated
+ * revocations of the same token and failed attempts (e.g. a missing or invalid
+ * revocation endpoint). Inspect the records with
+ * {@link getTokenRevocationRecords}. A successfully revoked access token is
+ * afterwards rejected client-side by {@link fetchProtectedResource} with a
+ * {@link RevokedTokenError}, keeping revocation state and protected resource
+ * access aligned.
+ *
  * > [!NOTE]\
  * > {@link ServerMetadata.revocation_endpoint URL of the authorization server's token revocation endpoint}
  * > must be configured.
@@ -4624,6 +4848,11 @@ export async function genericGrantRequest(
  *   being revoked
  * @param parameters Additional parameters to be included in the revocation
  *   request body, such as `token_type_hint`
+ *
+ * @throws {@link TokenRevocationError} When the revocation endpoint is missing
+ *   or invalid, the request could not be completed, or the authorization server
+ *   rejected the revocation. The error identifies which credential could not be
+ *   revoked and the failed attempt is still recorded.
  *
  * @group Token Management
  *
@@ -4635,18 +4864,109 @@ export async function tokenRevocation(
   parameters?: URLSearchParams | Record<string, string>,
 ): Promise<void> {
   checkConfig(config)
+  assertString(token, '"token"')
 
-  const { as, c, auth, fetch, tlsOnly, timeout } = int(config)
-  return oauth
-    .revocationRequest(as, c, auth, token, {
+  const { as, c, auth, fetch, tlsOnly, timeout, revocation } = int(config)
+  const additionalParameters = new URLSearchParams(parameters)
+  const hint = additionalParameters.get('token_type_hint')
+  const credential =
+    hint === 'access_token' || hint === 'refresh_token' ? hint : 'token'
+  const attempt =
+    1 + revocation.records.filter((record) => record.token === token).length
+  const duplicate = revocation.revoked.has(token)
+
+  let endpoint: URL | undefined
+  try {
+    endpoint = resolveRevocationEndpoint(as, c, tlsOnly)
+  } catch (err) {
+    const error = describeError(err)
+    recordRevocationAttempt(revocation, {
+      credential,
+      token,
+      ok: false,
+      attempt,
+      duplicate,
+      error,
+    })
+    throw new TokenRevocationError(
+      `failed to revoke the ${credential} credential, the revocation endpoint is not usable`,
+      { cause: err, code: ERR_TOKEN_REVOCATION_FAILED },
+      credential,
+      token,
+    )
+  }
+
+  try {
+    const response = await oauth.revocationRequest(as, c, auth, token, {
       [oauth.customFetch]: fetch,
       [oauth.allowInsecureRequests]: !tlsOnly,
-      additionalParameters: new URLSearchParams(parameters),
+      additionalParameters,
       headers: new Headers(headers),
       signal: signal(timeout),
     })
-    .then(oauth.processRevocationResponse)
-    .catch(errorHandler)
+    await oauth.processRevocationResponse(response)
+  } catch (err) {
+    const error = describeError(err)
+    recordRevocationAttempt(revocation, {
+      credential,
+      token,
+      endpoint: endpoint.href,
+      ok: false,
+      attempt,
+      duplicate,
+      error,
+    })
+    throw new TokenRevocationError(
+      `failed to revoke the ${credential} credential at "${endpoint.href}"`,
+      { cause: err, code: ERR_TOKEN_REVOCATION_FAILED },
+      credential,
+      token,
+    )
+  }
+
+  recordRevocationAttempt(revocation, {
+    credential,
+    token,
+    endpoint: endpoint.href,
+    ok: true,
+    attempt,
+    duplicate,
+  })
+  revocation.revoked.set(token, true)
+}
+
+/**
+ * Returns the recorded {@link tokenRevocation} attempts for a
+ * {@link Configuration}.
+ *
+ * The records cover every credential that was ever revoked through the
+ * configuration, including multiple distinct tokens, attempts against a missing
+ * or invalid revocation endpoint, and repeated revocations of an already
+ * revoked token. Records are returned in chronological order and are frozen.
+ *
+ * @group Token Management
+ */
+export function getTokenRevocationRecords(
+  config: Configuration,
+): readonly TokenRevocationRecord[] {
+  checkConfig(config)
+  return int(config).revocation.records
+}
+
+/**
+ * Returns whether a credential was already successfully revoked through
+ * {@link tokenRevocation} on the provided {@link Configuration}.
+ *
+ * A failed revocation attempt never marks the credential as revoked.
+ *
+ * @param token OAuth 2.0 token (either access token or refresh token)
+ *
+ * @group Token Management
+ */
+export function isTokenRevoked(config: Configuration, token: string): boolean {
+  checkConfig(config)
+  assertString(token, '"token"')
+  return int(config).revocation.revoked.has(token)
 }
 
 /**
@@ -4655,11 +4975,19 @@ export async function tokenRevocation(
  * Authorization Header is used to transmit the Access Token value. No other
  * Access Token means of transport are supported.
  *
+ * When the Access Token was already confirmed as revoked through
+ * {@link tokenRevocation} on the same {@link Configuration} the request fails
+ * locally with a {@link RevokedTokenError} and no network request is made, so
+ * that logout/revocation state and resource access stay aligned.
+ *
  * @param accessToken OAuth 2.0 Access Token
  * @param url URL to send the request to
  * @param method HTTP Request method to use for the request
  * @param body HTTP Request body to send in the request
  * @param headers HTTP Request headers to add to the request
+ *
+ * @throws {@link RevokedTokenError} When `accessToken` was previously revoked
+ *   on the provided {@link Configuration}
  *
  * @group Protected Resource Requests
  */
@@ -4673,6 +5001,13 @@ export async function fetchProtectedResource(
   options?: DPoPOptions,
 ): Promise<Response> {
   checkConfig(config)
+
+  if (int(config).revocation.revoked.has(accessToken)) {
+    throw new RevokedTokenError(
+      'refusing to use an access token that was already revoked',
+      accessToken,
+    )
+  }
 
   headers ||= new Headers()
   if (USER_AGENT && !headers.has('user-agent')) {
