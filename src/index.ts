@@ -28,6 +28,7 @@ interface Internal {
   decrypt?: oauth.JweDecryptFunction
   jwksCache: oauth.JWKSCacheInput
   implicit?: boolean
+  consumedAuthorizationCodes: Set<string>
 }
 
 const int = (config: Configuration) => {
@@ -2122,6 +2123,7 @@ export class Configuration
       tlsOnly: true,
       timeout: 30,
       jwksCache: {},
+      consumedAuthorizationCodes: new Set(),
     })
   }
 
@@ -3468,6 +3470,13 @@ function webInstanceOf<T>(input: unknown, toStringTag: string): input is T {
  * token. ID Token and Refresh Token are also optionally issued by the server.
  *
  * > [!NOTE]\
+ * > Each authorization code is consumed on first use: once an authorization
+ * > response has been processed its `code` cannot be exchanged again using
+ * > the same {@link Configuration} instance. Repeated callbacks or replays of
+ * > the same authorization response are rejected with a {@link ClientError}
+ * > with code `OAUTH_AUTHORIZATION_CODE_REPLAY`.
+ *
+ * > [!NOTE]\
  * > {@link ServerMetadata.token_endpoint URL of the authorization server's token endpoint}
  * > must be configured.
  *
@@ -3552,7 +3561,7 @@ export async function authorizationCodeGrant(
 
   let redirectUri: string
 
-  const { as, c, auth, fetch, tlsOnly, jarm, hybrid, nonRepudiation, timeout, decrypt, implicit } = int(config) // prettier-ignore
+  const { as, c, auth, fetch, tlsOnly, jarm, hybrid, nonRepudiation, timeout, decrypt, implicit, consumedAuthorizationCodes } = int(config) // prettier-ignore
 
   if (options?.flag === retry) {
     authResponse = options.authResponse!
@@ -3619,6 +3628,21 @@ export async function authorizationCodeGrant(
         } catch (err) {
           errorHandler(err)
         }
+    }
+
+    // Consume the authorization code so that a given authorization response
+    // can only be exchanged once per client configuration. A repeated
+    // callback (e.g. double submit, refresh) or a replay of the same
+    // authorization response in another session is rejected before it can
+    // reach the token endpoint again.
+    const code = authResponse.get('code')
+    if (code !== null) {
+      if (consumedAuthorizationCodes.has(code)) {
+        throw new ClientError('authorization code has already been consumed', {
+          code: 'OAUTH_AUTHORIZATION_CODE_REPLAY',
+        })
+      }
+      consumedAuthorizationCodes.add(code)
     }
   }
 

@@ -490,7 +490,7 @@ test('capture preserves response validation failures and prior result associatio
     .encrypt(otherKey.publicKey)
   respond(config, async () => tokenResponse(invalid))
   await assert.rejects(
-    client.authorizationCodeGrant(config, callback({ code: 'invalid' })),
+    client.authorizationCodeGrant(config, callback({ code: 'invalid-2' })),
     { code: 'OAUTH_DECRYPTION_FAILED' },
   )
   assert.deepStrictEqual(client.getDecryptedResponses(result), {
