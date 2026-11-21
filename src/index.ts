@@ -3203,6 +3203,8 @@ export async function implicitAuthentication(
   }
 
   try {
+    assertAuthorizationResponseParameters(params, IMPLICIT_RESPONSE_PARAMETERS)
+
     // validate state, iss, error codes etc
     {
       const decoy = new URLSearchParams(params)
@@ -3724,6 +3726,29 @@ async function validateJARMResponse(
   return result
 }
 
+const HYBRID_RESPONSE_PARAMETERS = Object.freeze([
+  'code',
+  'id_token',
+  'iss',
+  'state',
+])
+
+const IMPLICIT_RESPONSE_PARAMETERS = Object.freeze(['id_token', 'iss', 'state'])
+
+function assertAuthorizationResponseParameters(
+  parameters: URLSearchParams,
+  allowed: readonly string[],
+) {
+  for (const key of new Set(parameters.keys())) {
+    if (!allowed.includes(key)) {
+      throw new oauth.OperationProcessingError(
+        `unexpected "${key}" authorization response parameter encountered`,
+        { code: oauth.INVALID_RESPONSE, cause: { parameters } },
+      )
+    }
+  }
+}
+
 async function validateCodeIdTokenResponse(
   config: Configuration,
   authorizationResponse: URL,
@@ -3747,6 +3772,15 @@ async function validateCodeIdTokenResponse(
   }
 
   const { as, c, fetch, tlsOnly, timeout, decrypt, jwksCache } = int(config)
+
+  try {
+    assertAuthorizationResponseParameters(
+      new URLSearchParams(authorizationResponse.hash.slice(1)),
+      HYBRID_RESPONSE_PARAMETERS,
+    )
+  } catch (err) {
+    errorHandler(err)
+  }
 
   const signed = captureDecryptedResponse(decrypt)
   const result = await (
