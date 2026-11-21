@@ -3870,6 +3870,200 @@ export async function refreshTokenGrant(
 }
 
 /**
+ * State a {@link TokenRefreshSession} is initialized with. It represents the
+ * outcome of a previous grant (e.g. an authorization code grant) that yielded a
+ * refresh token.
+ *
+ * @group Token Management
+ */
+export interface TokenRefreshSessionState {
+  /**
+   * OAuth 2.0 Refresh Token the session starts with.
+   */
+  refresh_token: string
+
+  /**
+   * Scope that was granted together with the refresh token. The session keeps
+   * it up to date as it is refreshed: a `scope` value in a token endpoint
+   * response replaces it, an omitted `scope` leaves it unchanged.
+   */
+  scope?: string
+}
+
+/**
+ * A stateful OAuth 2.0 Refresh Token Grant session.
+ *
+ * Wraps {@link refreshTokenGrant} and tracks the current refresh token and scope
+ * so that applications don't have to juggle rotating refresh tokens
+ * themselves.
+ *
+ * The session applies the following semantics:
+ *
+ * - Each {@link TokenRefreshSession.refresh refresh} uses the session's current
+ *   refresh token.
+ * - Concurrent refreshes share a single token endpoint request and its result is
+ *   committed to the session state exactly once.
+ * - A response is only committed when no newer state was committed while the
+ *   request was in flight, so a stale response can never overwrite a newer
+ *   {@link TokenRefreshSession.generation generation}.
+ * - When the authorization server rotates the refresh token the new token
+ *   replaces the old one, otherwise the current refresh token is kept.
+ * - When the response omits `scope` the session's scope is left unchanged, as the
+ *   granted scope is identical to the previously granted one in that case.
+ * - A failed refresh leaves the session state untouched: the previous refresh
+ *   token, scope, and generation remain in effect and a later
+ *   {@link TokenRefreshSession.refresh refresh} retries with that preserved
+ *   state.
+ *
+ * @example
+ *
+ * ```ts
+ * let config!: client.Configuration
+ *
+ * let session = new client.TokenRefreshSession(config, {
+ *   refresh_token: 'refresh-token-from-a-previous-grant',
+ *   scope: 'openid email',
+ * })
+ *
+ * let tokenEndpointResponse = await session.refresh()
+ * ```
+ *
+ * @group Token Management
+ *
+ * @see [RFC 6749 - The OAuth 2.0 Authorization Framework](https://www.rfc-editor.org/rfc/rfc6749.html#section-6)
+ * @see {@link !OAuth 2.0 Security Best Current Practice Refresh Token Protection}
+ */
+export class TokenRefreshSession {
+  #config: Configuration
+  #options?: DPoPOptions
+  #refreshToken: string
+  #scope?: string
+  #generation = 0
+  #pending?: Promise<
+    WithDecryptedResponse<
+      oauth.TokenEndpointResponse & TokenEndpointResponseHelpers,
+      string
+    >
+  >
+
+  /**
+   * @param config Configuration to use for the refresh token grant requests
+   * @param state State the session starts with, see
+   *   {@link TokenRefreshSessionState}
+   * @param options Default {@link DPoPOptions} for every refresh, may be
+   *   overridden per {@link TokenRefreshSession.refresh refresh} call
+   */
+  constructor(
+    config: Configuration,
+    state: TokenRefreshSessionState,
+    options?: DPoPOptions,
+  ) {
+    checkConfig(config)
+    assertString(state?.refresh_token, '"state.refresh_token"')
+    if (state.scope !== undefined) {
+      assertString(state.scope, '"state.scope"')
+    }
+
+    this.#config = config
+    this.#refreshToken = state.refresh_token
+    this.#scope = state.scope
+    this.#options = options
+  }
+
+  /**
+   * Number of successful refreshes committed to the session. Starts at `0` and
+   * increments by one every time a refresh outcome is committed, never when a
+   * refresh fails.
+   */
+  get generation(): number {
+    return this.#generation
+  }
+
+  /**
+   * The session's current refresh token. Reflects refresh token rotation
+   * performed by the authorization server.
+   */
+  get refreshToken(): string {
+    return this.#refreshToken
+  }
+
+  /**
+   * The session's current scope. Only changes when the authorization server
+   * returns a `scope` value in the token endpoint response.
+   */
+  get scope(): string | undefined {
+    return this.#scope
+  }
+
+  /**
+   * Refreshes the session using its current refresh token and commits the
+   * outcome to the session state.
+   *
+   * Concurrent calls share a single token endpoint request, its result is
+   * committed exactly once, and all callers settle with the same outcome. A
+   * rejected promise does not modify the session state.
+   *
+   * @param parameters Additional parameters that will be sent to the token
+   *   endpoint, typically used for parameters such as `scope` and a `resource`
+   *   ({@link !"Resource Indicators" Resource Indicator})
+   * @param options {@link DPoPOptions} for this refresh, takes precedence over
+   *   the ones provided to the constructor
+   *
+   * @returns The token endpoint response, same as {@link refreshTokenGrant}
+   *   resolves with
+   */
+  async refresh(
+    parameters?: URLSearchParams | Record<string, string>,
+    options?: DPoPOptions,
+  ): Promise<
+    WithDecryptedResponse<
+      oauth.TokenEndpointResponse & TokenEndpointResponseHelpers,
+      string
+    >
+  > {
+    return (this.#pending ??= this.#execute(parameters, options))
+  }
+
+  async #execute(
+    parameters?: URLSearchParams | Record<string, string>,
+    options?: DPoPOptions,
+  ): Promise<
+    WithDecryptedResponse<
+      oauth.TokenEndpointResponse & TokenEndpointResponseHelpers,
+      string
+    >
+  > {
+    const refreshToken = this.#refreshToken
+    const generation = this.#generation
+    try {
+      const result = await refreshTokenGrant(
+        this.#config,
+        refreshToken,
+        parameters,
+        options ?? this.#options,
+      )
+
+      // Commit the outcome exactly once and only when no newer state was
+      // committed while the request was in flight, so that a stale response
+      // can never overwrite a newer generation.
+      if (this.#generation === generation) {
+        if (typeof result.refresh_token === 'string') {
+          this.#refreshToken = result.refresh_token
+        }
+        if (typeof result.scope === 'string') {
+          this.#scope = result.scope
+        }
+        this.#generation = generation + 1
+      }
+
+      return result
+    } finally {
+      this.#pending = undefined
+    }
+  }
+}
+
+/**
  * Performs an OAuth 2.0 Client Credentials Grant.
  *
  * Performs an OAuth 2.0 {@link !"Client Credentials Grant"} at the Authorization
